@@ -18,9 +18,8 @@ export default function Teleprompter({ script, settings }) {
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
 
-  const content = script.content || "";
+  const content = script?.content || "";
   const hasContent = Boolean(content.trim());
-
   const words = hasContent ? content.trim().split(/\s+/).length : 0;
 
   const estimatedSeconds = Math.max(1, (words / 130) * 60);
@@ -32,14 +31,19 @@ export default function Teleprompter({ script, settings }) {
         )}s`
       : `${Math.round(estimatedSeconds)}s`;
 
-  function reset() {
-    setPlaying(false);
-    lastTimeRef.current = null;
-
-    if (frameRef.current) {
+  // Cancel any pending animation frame.
+  function cancelAnimation() {
+    if (frameRef.current !== null) {
       cancelAnimationFrame(frameRef.current);
       frameRef.current = null;
     }
+  }
+
+  // Restart scrolling from the beginning.
+  function reset() {
+    setPlaying(false);
+    cancelAnimation();
+    lastTimeRef.current = null;
 
     if (viewportRef.current) {
       viewportRef.current.scrollTop = 0;
@@ -48,29 +52,25 @@ export default function Teleprompter({ script, settings }) {
     setProgress(0);
   }
 
+  // Play or pause without jumping the scroll position.
   function togglePlayback() {
-    if (!playing && viewportRef.current) {
-      const viewport = viewportRef.current;
-      const maxScroll = viewport.scrollHeight - viewport.clientHeight;
-
-      if (maxScroll <= 0 || viewport.scrollTop >= maxScroll) {
-        viewport.scrollTop = 0;
-        setProgress(0);
-      }
-    }
-
     lastTimeRef.current = null;
     setPlaying((current) => !current);
   }
 
+  // Toggle fullscreen on the complete teleprompter panel.
   async function toggleFullscreen() {
     const element = panelRef.current;
+
     if (!element) return;
 
     try {
-      if (document.fullscreenElement) {
+      if (document.fullscreenElement === element) {
         await document.exitFullscreen();
+      } else if (!document.fullscreenElement) {
+        await element.requestFullscreen();
       } else {
+        await document.exitFullscreen();
         await element.requestFullscreen();
       }
     } catch (error) {
@@ -78,13 +78,19 @@ export default function Teleprompter({ script, settings }) {
     }
   }
 
+  // Recalculate dimensions continuously while scrolling.
   useEffect(() => {
-    if (!playing) return;
+    if (!playing) {
+      cancelAnimation();
+      lastTimeRef.current = null;
+      return;
+    }
 
     function animate(timestamp) {
       const viewport = viewportRef.current;
 
       if (!viewport) {
+        frameRef.current = null;
         setPlaying(false);
         return;
       }
@@ -97,26 +103,43 @@ export default function Teleprompter({ script, settings }) {
 
       lastTimeRef.current = timestamp;
 
+      // Read the current dimensions on every frame.
+      // These may change when entering or leaving fullscreen.
       const maxScroll = Math.max(
         0,
         viewport.scrollHeight - viewport.clientHeight,
       );
 
-      const seconds = Math.max(1, settings.duration * 60);
-      const pixelsPerSecond = (maxScroll / seconds) * settings.speed;
+      if (maxScroll <= 0) {
+        viewport.scrollTop = 0;
+        setProgress(0);
+        frameRef.current = null;
+        setPlaying(false);
+        return;
+      }
 
-      viewport.scrollTop += pixelsPerSecond * delta;
+      const durationSeconds = Math.max(1, Number(settings.duration) * 60 || 1);
 
-      const nextProgress =
-        maxScroll > 0
-          ? Math.min(100, (viewport.scrollTop / maxScroll) * 100)
-          : 100;
+      const speed = Math.max(0.1, Number(settings.speed) || 1);
+
+      const pixelsPerSecond = (maxScroll / durationSeconds) * speed;
+
+      const nextScrollTop = Math.min(
+        viewport.scrollTop + pixelsPerSecond * delta,
+        maxScroll,
+      );
+
+      viewport.scrollTop = nextScrollTop;
+
+      const nextProgress = Math.min(100, (nextScrollTop / maxScroll) * 100);
 
       setProgress(nextProgress);
 
-      if (viewport.scrollTop >= maxScroll - 1) {
+      if (nextScrollTop >= maxScroll - 1) {
         viewport.scrollTop = maxScroll;
         setProgress(100);
+        frameRef.current = null;
+        lastTimeRef.current = null;
         setPlaying(false);
         return;
       }
@@ -127,10 +150,8 @@ export default function Teleprompter({ script, settings }) {
     frameRef.current = requestAnimationFrame(animate);
 
     return () => {
-      if (frameRef.current) {
-        cancelAnimationFrame(frameRef.current);
-        frameRef.current = null;
-      }
+      cancelAnimation();
+      lastTimeRef.current = null;
     };
   }, [
     playing,
@@ -141,22 +162,52 @@ export default function Teleprompter({ script, settings }) {
     content,
   ]);
 
+  // Keep the animation timing stable when fullscreen changes.
+  useEffect(() => {
+    function handleFullscreenChange() {
+      lastTimeRef.current = null;
+
+      // Allow the browser to finish its fullscreen layout update
+      // before the next animation frame reads the dimensions.
+      if (viewportRef.current) {
+        const viewport = viewportRef.current;
+        const maxScroll = Math.max(
+          0,
+          viewport.scrollHeight - viewport.clientHeight,
+        );
+
+        if (maxScroll > 0) {
+          setProgress(Math.min(100, (viewport.scrollTop / maxScroll) * 100));
+        }
+      }
+    }
+
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+    };
+  }, []);
+
+  // Keyboard shortcuts.
   useEffect(() => {
     function onKeyDown(event) {
-      const tag = event.target?.tagName;
+      const target = event.target;
+      const tag = target?.tagName;
 
       if (
         tag === "INPUT" ||
         tag === "TEXTAREA" ||
         tag === "SELECT" ||
-        event.target?.isContentEditable
+        target?.isContentEditable
       ) {
         return;
       }
 
       if (event.code === "Space") {
         event.preventDefault();
-        togglePlayback();
+        lastTimeRef.current = null;
+        setPlaying((current) => !current);
       }
 
       if (event.key.toLowerCase() === "r") {
@@ -164,18 +215,23 @@ export default function Teleprompter({ script, settings }) {
       }
 
       if (event.key === "Escape" && document.fullscreenElement) {
-        document.exitFullscreen();
+        document.exitFullscreen().catch((error) => {
+          console.error("Could not exit fullscreen:", error);
+        });
       }
     }
 
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  });
+
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
 
   return (
     <section
       ref={panelRef}
-      className="flex min-w-0 flex-col gap-5 bg-white text-slate-900"
+      className="teleprompter-panel flex min-w-0 flex-col gap-5 bg-white text-slate-900"
     >
       {/* Header */}
       <div className="flex items-center justify-between gap-3">
@@ -184,10 +240,12 @@ export default function Teleprompter({ script, settings }) {
             <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600">
               <Type size={19} />
             </span>
+
             <h2 className="text-base font-bold tracking-tight sm:text-lg">
               Live teleprompter
             </h2>
           </div>
+
           <p className="mt-1 pl-11 text-sm text-slate-500">
             Read at your own pace.
           </p>
@@ -205,7 +263,7 @@ export default function Teleprompter({ script, settings }) {
       </div>
 
       {/* Preview stage */}
-      <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-950 shadow-inner">
+      <div className="teleprompter-stage overflow-hidden rounded-2xl border border-slate-800 bg-slate-950 shadow-inner">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 px-4 py-3 sm:px-5">
           <div className="flex items-center gap-2">
             <span
@@ -213,6 +271,7 @@ export default function Teleprompter({ script, settings }) {
                 playing ? "animate-pulse bg-emerald-400" : "bg-slate-500"
               }`}
             />
+
             <span className="text-[10px] font-bold tracking-[0.16em] text-slate-300">
               {playing ? "SCROLLING" : "PREVIEW"}
             </span>
@@ -224,7 +283,7 @@ export default function Teleprompter({ script, settings }) {
           </span>
         </div>
 
-        <div className="relative">
+        <div className="teleprompter-reading-area relative min-h-0">
           {/* Reading guides */}
           <div className="pointer-events-none absolute inset-x-0 top-[22%] z-10 border-t border-rose-400/40" />
           <div className="pointer-events-none absolute inset-x-0 top-[66%] z-10 border-t border-rose-400/40" />
@@ -233,7 +292,7 @@ export default function Teleprompter({ script, settings }) {
           <div
             ref={viewportRef}
             aria-label="Teleprompter reading area"
-            className="h-[360px] overflow-y-auto overscroll-contain px-5 py-16 text-center text-slate-100 sm:h-[440px] sm:px-8 sm:py-20 lg:h-[520px] lg:px-10"
+            className="teleprompter-viewport h-[360px] overflow-y-auto overscroll-contain px-5 py-16 text-center text-slate-100 sm:h-[440px] sm:px-8 sm:py-20 lg:h-[520px] lg:px-10"
             style={{
               scrollbarWidth: "thin",
               scrollbarColor: "#475569 transparent",
@@ -336,23 +395,49 @@ export default function Teleprompter({ script, settings }) {
         </span>
       </div>
 
-      {/* Fullscreen-specific styling */}
+      {/* Fullscreen layout: use named classes, not DOM position selectors. */}
       <style>{`
-        section:fullscreen {
+        .teleprompter-panel:fullscreen {
           box-sizing: border-box;
           width: 100%;
           height: 100%;
-          overflow-y: auto;
-          padding: clamp(16px, 3vw, 40px);
+          height: 100dvh;
+          min-height: 0;
+          overflow: hidden;
+          display: flex;
+          flex-direction: column;
+          gap: 16px;
+          padding: clamp(12px, 2vw, 28px);
           background: #ffffff;
         }
 
-        section:fullscreen > div:nth-of-type(2) > div:nth-child(2) {
-          height: min(65vh, 760px);
+        .teleprompter-panel:fullscreen .teleprompter-stage {
+          flex: 1 1 0;
+          min-height: 0;
+          display: flex;
+          flex-direction: column;
+        }
+
+        .teleprompter-panel:fullscreen .teleprompter-reading-area {
+          flex: 1 1 0;
+          min-height: 0;
+        }
+
+        .teleprompter-panel:fullscreen .teleprompter-viewport {
+          height: 100%;
+          min-height: 0;
+          max-height: none;
+          overscroll-behavior: contain;
+        }
+
+        .teleprompter-panel:fullscreen > div:nth-of-type(3),
+        .teleprompter-panel:fullscreen > div:nth-of-type(4) {
+          flex-shrink: 0;
         }
 
         @media (max-width: 640px) {
-          section:fullscreen {
+          .teleprompter-panel:fullscreen {
+            gap: 10px;
             padding: 12px;
           }
         }
